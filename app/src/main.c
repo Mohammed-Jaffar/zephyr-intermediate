@@ -4,77 +4,89 @@
 LOG_MODULE_REGISTER(demo, LOG_LEVEL_DBG);
 
 #define STACK_SIZE 1024
+#define PRIO_WORKER 5
+#define NUM_INCREMENTS 20
 
-#define PRIO_LOW  7
-#define PRIO_MED  5
-#define PRIO_HIGH 3
-#define PRIO_COOP (-1)
+static int shared_counter;
+static struct k_mutex counter_lock;
 
-#define COOP_BUSY_ITERATIONS 5
-#define COOP_BUSY_MS_PER_ITER 100
+struct worker_args {
+	const char *name;
+	bool use_mutex;
+};
 
-void t_low_fn(void *p1, void *p2, void *p3)
+static void increment_counter(bool use_mutex, const char *name)
 {
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	while (1) {
-		LOG_INF("T_LOW running");
-		k_msleep(300);
-	}
-}
-
-void t_med_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	while (1) {
-		LOG_INF("T_MED running");
-		k_msleep(200);
-	}
-}
-
-void t_high_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	while (1) {
-		LOG_INF("T_HIGH running");
-		k_msleep(100);
-	}
-}
-
-void t_coop_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	for (int i = 1; i <= COOP_BUSY_ITERATIONS; i++) {
-		LOG_INF("T_COOP busy iteration %d/%d", i, COOP_BUSY_ITERATIONS);
-		k_busy_wait(COOP_BUSY_MS_PER_ITER * 1000);
+	if (use_mutex) {
+		k_mutex_lock(&counter_lock, K_FOREVER);
 	}
 
-	LOG_INF("T_COOP done, calling k_yield()");
+	int temp = shared_counter;
+
 	k_yield();
-	LOG_INF("T_COOP resumed after k_yield(), thread exiting");
+
+	temp = temp + 1;
+	shared_counter = temp;
+
+	if (use_mutex) {
+		k_mutex_unlock(&counter_lock);
+	}
+
+	LOG_INF("%s -> counter = %d", name, shared_counter);
 }
 
-K_THREAD_DEFINE(t_low, STACK_SIZE, t_low_fn,
-		 NULL, NULL, NULL, PRIO_LOW, 0, 0);
-K_THREAD_DEFINE(t_med, STACK_SIZE, t_med_fn,
-		 NULL, NULL, NULL, PRIO_MED, 0, 0);
-K_THREAD_DEFINE(t_high, STACK_SIZE, t_high_fn,
-		 NULL, NULL, NULL, PRIO_HIGH, 0, 0);
-K_THREAD_DEFINE(t_coop, STACK_SIZE, t_coop_fn,
-		 NULL, NULL, NULL, PRIO_COOP, 0, 0);
+static void worker_fn(void *p1, void *p2, void *p3)
+{
+	struct worker_args *args = (struct worker_args *)p1;
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	for (int i = 0; i < NUM_INCREMENTS; i++) {
+		increment_counter(args->use_mutex, args->name);
+	}
+}
+
+static struct k_thread worker_a_thread;
+static struct k_thread worker_b_thread;
+K_THREAD_STACK_DEFINE(worker_a_stack, STACK_SIZE);
+K_THREAD_STACK_DEFINE(worker_b_stack, STACK_SIZE);
+
+static void run_pair(struct worker_args *a, struct worker_args *b)
+{
+	k_tid_t tid_a = k_thread_create(&worker_a_thread, worker_a_stack,
+					 K_THREAD_STACK_SIZEOF(worker_a_stack),
+					 worker_fn, a, NULL, NULL,
+					 PRIO_WORKER, 0, K_NO_WAIT);
+	k_tid_t tid_b = k_thread_create(&worker_b_thread, worker_b_stack,
+					 K_THREAD_STACK_SIZEOF(worker_b_stack),
+					 worker_fn, b, NULL, NULL,
+					 PRIO_WORKER, 0, K_NO_WAIT);
+
+	k_thread_join(tid_a, K_FOREVER);
+	k_thread_join(tid_b, K_FOREVER);
+}
 
 int main(void)
 {
+	struct worker_args unsafe_a = { .name = "UNSAFE_A", .use_mutex = false };
+	struct worker_args unsafe_b = { .name = "UNSAFE_B", .use_mutex = false };
+	struct worker_args safe_a = { .name = "SAFE_A", .use_mutex = true };
+	struct worker_args safe_b = { .name = "SAFE_B", .use_mutex = true };
+
+	k_mutex_init(&counter_lock);
+
+	LOG_INF("=== Unsafe pass: no locking ===");
+	shared_counter = 0;
+	run_pair(&unsafe_a, &unsafe_b);
+	LOG_INF("Unsafe final counter = %d (expected %d)", shared_counter,
+		NUM_INCREMENTS * 2);
+
+	LOG_INF("=== Safe pass: mutex protected ===");
+	shared_counter = 0;
+	run_pair(&safe_a, &safe_b);
+	LOG_INF("Safe final counter = %d (expected %d)", shared_counter,
+		NUM_INCREMENTS * 2);
+
 	return 0;
 }
