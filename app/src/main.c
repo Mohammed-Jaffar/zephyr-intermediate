@@ -1,92 +1,117 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(demo, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(homework, LOG_LEVEL_DBG);
 
-#define STACK_SIZE 1024
-#define PRIO_WORKER 5
-#define NUM_INCREMENTS 20
+#define STACK_SIZE          1024
+#define SENSOR_MS           100
+#define EVENT_COUNT          10
 
-static int shared_counter;
-static struct k_mutex counter_lock;
+#define BURST_EVENTS          5
+#define BURST_INTERVAL_MS     4
+#define DEBOUNCE_MS          30
 
-struct worker_args {
-	const char *name;
-	bool use_mutex;
-};
+static int events_processed;
 
-static void increment_counter(bool use_mutex, const char *name)
+static void sensor_handler(struct k_work *work)
 {
-	if (use_mutex) {
-		k_mutex_lock(&counter_lock, K_FOREVER);
-	}
+	ARG_UNUSED(work);
 
-	int temp = shared_counter;
-
-	k_yield();
-
-	temp = temp + 1;
-	shared_counter = temp;
-
-	if (use_mutex) {
-		k_mutex_unlock(&counter_lock);
-	}
-
-	LOG_INF("%s -> counter = %d", name, shared_counter);
+	events_processed++;
+	LOG_INF("[HANDLER] processed event %d  tick=%u",
+		events_processed, k_uptime_get_32());
 }
 
-static void worker_fn(void *p1, void *p2, void *p3)
-{
-	struct worker_args *args = (struct worker_args *)p1;
+K_WORK_DEFINE(sensor_work, sensor_handler);
 
+static void sensor_sim_fn(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	for (int i = 0; i < NUM_INCREMENTS; i++) {
-		increment_counter(args->use_mutex, args->name);
+	for (int i = 0; i < EVENT_COUNT; i++) {
+		k_msleep(SENSOR_MS);
+
+		LOG_INF("[SENSOR] event %d  tick=%u", i, k_uptime_get_32());
+
+		int ret = k_work_submit(&sensor_work);
+
+		if (ret < 0) {
+			LOG_ERR("submit failed: %d", ret);
+		}
 	}
+
+	LOG_INF("[SENSOR] all events produced");
 }
 
-static struct k_thread worker_a_thread;
-static struct k_thread worker_b_thread;
-K_THREAD_STACK_DEFINE(worker_a_stack, STACK_SIZE);
-K_THREAD_STACK_DEFINE(worker_b_stack, STACK_SIZE);
+static int debounce_triggers;
+static int debounce_calls;
 
-static void run_pair(struct worker_args *a, struct worker_args *b)
+static void debounce_handler(struct k_work *work)
 {
-	k_tid_t tid_a = k_thread_create(&worker_a_thread, worker_a_stack,
-					 K_THREAD_STACK_SIZEOF(worker_a_stack),
-					 worker_fn, a, NULL, NULL,
-					 PRIO_WORKER, 0, K_NO_WAIT);
-	k_tid_t tid_b = k_thread_create(&worker_b_thread, worker_b_stack,
-					 K_THREAD_STACK_SIZEOF(worker_b_stack),
-					 worker_fn, b, NULL, NULL,
-					 PRIO_WORKER, 0, K_NO_WAIT);
+	ARG_UNUSED(work);
 
-	k_thread_join(tid_a, K_FOREVER);
-	k_thread_join(tid_b, K_FOREVER);
+	debounce_calls++;
+	LOG_INF("[DEBOUNCE] handler fired  calls=%d  tick=%u",
+		debounce_calls, k_uptime_get_32());
 }
+
+K_WORK_DELAYABLE_DEFINE(debounce_work, debounce_handler);
+
+static void burst_sim_fn(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	for (int i = 0; i < BURST_EVENTS; i++) {
+		debounce_triggers++;
+		LOG_INF("[BURST] trigger %d  tick=%u",
+			debounce_triggers, k_uptime_get_32());
+
+		k_work_reschedule(&debounce_work, K_MSEC(DEBOUNCE_MS));
+
+		k_msleep(BURST_INTERVAL_MS);
+	}
+
+	LOG_INF("[BURST] burst complete, waiting for debounce window");
+}
+
+static struct k_thread sensor_thread_data;
+static struct k_thread burst_thread_data;
+K_THREAD_STACK_DEFINE(sensor_stack, STACK_SIZE);
+K_THREAD_STACK_DEFINE(burst_stack, STACK_SIZE);
 
 int main(void)
 {
-	struct worker_args unsafe_a = { .name = "UNSAFE_A", .use_mutex = false };
-	struct worker_args unsafe_b = { .name = "UNSAFE_B", .use_mutex = false };
-	struct worker_args safe_a = { .name = "SAFE_A", .use_mutex = true };
-	struct worker_args safe_b = { .name = "SAFE_B", .use_mutex = true };
+	LOG_INF("=== L3 Task: Polling to Workqueue (event-driven) ===");
+	LOG_INF("sensor_sim fires %d events, %dms apart, via k_work_submit",
+		EVENT_COUNT, SENSOR_MS);
 
-	k_mutex_init(&counter_lock);
+	k_tid_t sensor_tid = k_thread_create(&sensor_thread_data, sensor_stack,
+					      K_THREAD_STACK_SIZEOF(sensor_stack),
+					      sensor_sim_fn, NULL, NULL, NULL,
+					      5, 0, K_NO_WAIT);
+	k_thread_join(sensor_tid, K_FOREVER);
+	k_msleep(20);
 
-	LOG_INF("=== Unsafe pass: no locking ===");
-	shared_counter = 0;
-	run_pair(&unsafe_a, &unsafe_b);
-	LOG_INF("Unsafe final counter = %d (expected %d)", shared_counter,
-		NUM_INCREMENTS * 2);
+	LOG_INF("[SUMMARY] events_fired=%d  handler_calls=%d",
+		EVENT_COUNT, events_processed);
 
-	LOG_INF("=== Safe pass: mutex protected ===");
-	shared_counter = 0;
-	run_pair(&safe_a, &safe_b);
-	LOG_INF("Safe final counter = %d (expected %d)", shared_counter,
-		NUM_INCREMENTS * 2);
+	LOG_INF("=== BONUS: debounce a burst with k_work_reschedule ===");
+	LOG_INF("%d triggers within ~%dms, debounce window=%dms",
+		BURST_EVENTS, BURST_EVENTS * BURST_INTERVAL_MS, DEBOUNCE_MS);
+
+	k_tid_t burst_tid = k_thread_create(&burst_thread_data, burst_stack,
+					     K_THREAD_STACK_SIZEOF(burst_stack),
+					     burst_sim_fn, NULL, NULL, NULL,
+					     5, 0, K_NO_WAIT);
+	k_thread_join(burst_tid, K_FOREVER);
+	k_msleep(DEBOUNCE_MS + 50);
+
+	LOG_INF("[SUMMARY] triggers=%d  handler_calls=%d",
+		debounce_triggers, debounce_calls);
 
 	return 0;
 }
