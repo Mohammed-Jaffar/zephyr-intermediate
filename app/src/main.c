@@ -1,117 +1,132 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/zbus/zbus.h>
 
-LOG_MODULE_REGISTER(homework, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(zbus_demo, LOG_LEVEL_DBG);
 
-#define STACK_SIZE          1024
-#define SENSOR_MS           100
-#define EVENT_COUNT          10
+#define PUBLISH_PERIOD_MS    100
+#define SAMPLE_COUNT         50
+#define LOGGER_DELAY_MS      500
+#define LOGGER_QUEUE_SIZE    8
+#define STACK_SIZE           1024
+#define PRIO_PUBLISHER       5
+#define PRIO_LOGGER          7
 
-#define BURST_EVENTS          5
-#define BURST_INTERVAL_MS     4
-#define DEBOUNCE_MS          30
+struct sensor_msg {
+	uint32_t seq;
+	int32_t temp_c_x100;
+	uint32_t humidity_pct;
+	uint32_t tick_ms;
+};
 
-static int events_processed;
+static void display_listener_cb(const struct zbus_channel *chan);
+ZBUS_LISTENER_DEFINE(display_listener, display_listener_cb);
+ZBUS_SUBSCRIBER_DEFINE(logger_sub, LOGGER_QUEUE_SIZE);
 
-static void sensor_handler(struct k_work *work)
+ZBUS_CHAN_DEFINE(sensor_chan,
+		 struct sensor_msg,
+		 NULL,
+		 NULL,
+		 ZBUS_OBSERVERS(display_listener, logger_sub),
+		 ZBUS_MSG_INIT(0));
+
+static void display_listener_cb(const struct zbus_channel *chan)
 {
-	ARG_UNUSED(work);
+	const struct sensor_msg *msg = zbus_chan_const_msg(chan);
 
-	events_processed++;
-	LOG_INF("[HANDLER] processed event %d  tick=%u",
-		events_processed, k_uptime_get_32());
+	LOG_INF("[DISPLAY] seq=%u  temp=%d.%02d C  hum=%u%%",
+		msg->seq, msg->temp_c_x100 / 100,
+		(msg->temp_c_x100 < 0 ? -msg->temp_c_x100 : msg->temp_c_x100) % 100,
+		msg->humidity_pct);
 }
 
-K_WORK_DEFINE(sensor_work, sensor_handler);
-
-static void sensor_sim_fn(void *p1, void *p2, void *p3)
+static void publisher_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	for (int i = 0; i < EVENT_COUNT; i++) {
-		k_msleep(SENSOR_MS);
+	int64_t next = k_uptime_get();
 
-		LOG_INF("[SENSOR] event %d  tick=%u", i, k_uptime_get_32());
+	for (uint32_t seq = 0; seq < SAMPLE_COUNT; seq++) {
+		struct sensor_msg msg = {
+			.seq = seq,
+			.temp_c_x100 = 2000 + (int32_t)(seq % 20) * 10,
+			.humidity_pct = 40 + (seq % 10),
+			.tick_ms = (uint32_t)k_uptime_get_32(),
+		};
 
-		int ret = k_work_submit(&sensor_work);
+		int ret = zbus_chan_pub(&sensor_chan, &msg, K_MSEC(10));
 
 		if (ret < 0) {
-			LOG_ERR("submit failed: %d", ret);
+			LOG_ERR("publish seq=%u failed: %d", seq, ret);
+		}
+
+		next += PUBLISH_PERIOD_MS;
+		int64_t sleep_ms = next - k_uptime_get();
+
+		if (sleep_ms > 0) {
+			k_msleep(sleep_ms);
 		}
 	}
 
-	LOG_INF("[SENSOR] all events produced");
+	LOG_INF("[PUBLISHER] done, %d samples published", SAMPLE_COUNT);
 }
 
-static int debounce_triggers;
-static int debounce_calls;
-
-static void debounce_handler(struct k_work *work)
-{
-	ARG_UNUSED(work);
-
-	debounce_calls++;
-	LOG_INF("[DEBOUNCE] handler fired  calls=%d  tick=%u",
-		debounce_calls, k_uptime_get_32());
-}
-
-K_WORK_DELAYABLE_DEFINE(debounce_work, debounce_handler);
-
-static void burst_sim_fn(void *p1, void *p2, void *p3)
+static void logger_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	for (int i = 0; i < BURST_EVENTS; i++) {
-		debounce_triggers++;
-		LOG_INF("[BURST] trigger %d  tick=%u",
-			debounce_triggers, k_uptime_get_32());
+	const struct zbus_channel *chan;
+	struct sensor_msg msg;
+	uint32_t logged = 0;
+	uint32_t last_seq = 0;
+	bool first = true;
 
-		k_work_reschedule(&debounce_work, K_MSEC(DEBOUNCE_MS));
+	while (1) {
+		int ret = zbus_sub_wait(&logger_sub, &chan, K_MSEC(1000));
 
-		k_msleep(BURST_INTERVAL_MS);
+		if (ret == -EAGAIN) {
+			break;
+		}
+
+		if (ret < 0) {
+			LOG_ERR("sub_wait failed: %d", ret);
+			continue;
+		}
+
+		ret = zbus_chan_read(chan, &msg, K_MSEC(100));
+		if (ret < 0) {
+			LOG_ERR("chan_read failed: %d", ret);
+			continue;
+		}
+
+		k_msleep(LOGGER_DELAY_MS);
+
+		logged++;
+		if (!first && msg.seq > last_seq + 1) {
+			LOG_WRN("[LOGGER] skipped %u samples", msg.seq - last_seq - 1);
+		}
+		first = false;
+		last_seq = msg.seq;
+
+		LOG_INF("[LOGGER] seq=%u tick=%u temp=%d hum=%u",
+			msg.seq, msg.tick_ms, msg.temp_c_x100, msg.humidity_pct);
 	}
 
-	LOG_INF("[BURST] burst complete, waiting for debounce window");
+	LOG_INF("[LOGGER] finished, logged=%u", logged);
 }
 
-static struct k_thread sensor_thread_data;
-static struct k_thread burst_thread_data;
-K_THREAD_STACK_DEFINE(sensor_stack, STACK_SIZE);
-K_THREAD_STACK_DEFINE(burst_stack, STACK_SIZE);
+K_THREAD_DEFINE(publisher_tid, STACK_SIZE, publisher_fn,
+		NULL, NULL, NULL, PRIO_PUBLISHER, 0, 0);
+K_THREAD_DEFINE(logger_tid, STACK_SIZE, logger_fn,
+		NULL, NULL, NULL, PRIO_LOGGER, 0, 0);
 
 int main(void)
 {
-	LOG_INF("=== L3 Task: Polling to Workqueue (event-driven) ===");
-	LOG_INF("sensor_sim fires %d events, %dms apart, via k_work_submit",
-		EVENT_COUNT, SENSOR_MS);
-
-	k_tid_t sensor_tid = k_thread_create(&sensor_thread_data, sensor_stack,
-					      K_THREAD_STACK_SIZEOF(sensor_stack),
-					      sensor_sim_fn, NULL, NULL, NULL,
-					      5, 0, K_NO_WAIT);
-	k_thread_join(sensor_tid, K_FOREVER);
-	k_msleep(20);
-
-	LOG_INF("[SUMMARY] events_fired=%d  handler_calls=%d",
-		EVENT_COUNT, events_processed);
-
-	LOG_INF("=== BONUS: debounce a burst with k_work_reschedule ===");
-	LOG_INF("%d triggers within ~%dms, debounce window=%dms",
-		BURST_EVENTS, BURST_EVENTS * BURST_INTERVAL_MS, DEBOUNCE_MS);
-
-	k_tid_t burst_tid = k_thread_create(&burst_thread_data, burst_stack,
-					     K_THREAD_STACK_SIZEOF(burst_stack),
-					     burst_sim_fn, NULL, NULL, NULL,
-					     5, 0, K_NO_WAIT);
-	k_thread_join(burst_tid, K_FOREVER);
-	k_msleep(DEBOUNCE_MS + 50);
-
-	LOG_INF("[SUMMARY] triggers=%d  handler_calls=%d",
-		debounce_triggers, debounce_calls);
-
+	LOG_INF("=== L4 zbus: sensor channel ===");
+	LOG_INF("publish every %dms, %d samples", PUBLISH_PERIOD_MS, SAMPLE_COUNT);
 	return 0;
 }
