@@ -38,6 +38,6 @@ int main(void)
 
 	k_thread_create(&parser_thread, parser_stack, PARSER_STACK_SIZE,
 			parser_entry, (void *)attack_index, NULL, NULL,
-			5, 0, K_NO_WAIT);
+			5, K_USER, K_NO_WAIT);
 	return 0;
 }
