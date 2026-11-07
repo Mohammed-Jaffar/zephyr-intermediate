@@ -1,167 +1,143 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/task_wdt/task_wdt.h>
+#include <zephyr/tracing/tracing.h>
 
-LOG_MODULE_REGISTER(reliability, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(homework, LOG_LEVEL_INF);
 
-#define STACK_SIZE            1024
-#define PRIO_PRODUCER         5
-#define PRIO_CONSUMER         5
-#define PRIO_HEALTH           7
+#define STACK_SIZE            2048
+#define CONTROL_PRIORITY         7
+#define MAINTENANCE_PRIORITY     4
+#define EVENT_PERIOD_MS        250
+#define MAINTENANCE_LOAD_US  45000
+#define DEADLINE_US          10000
+#define EVENT_TOTAL             40
+#define SUMMARY_EVERY           10
+#define QUEUE_DEPTH              4
 
-#define QUEUE_DEPTH           8
-#define WARN_PERCENT          75
-#define WARN_LEVEL            ((QUEUE_DEPTH * WARN_PERCENT) / 100)
-
-#define PRODUCE_PERIOD_MS     50
-#define CONSUME_TIME_MS       40
-#define TOTAL_MESSAGES        200
-#define STUCK_AFTER_MSG       20
-#define STUCK_TIME_MS         3000
-#define WDT_PERIOD_MS         1000
-#define HEALTH_PERIOD_MS      100
-
-struct sample {
+struct control_event {
 	uint32_t seq;
-	uint32_t ts_ms;
+	int64_t ready_ticks;
 };
 
-K_MSGQ_DEFINE(pipe_q, sizeof(struct sample), QUEUE_DEPTH, 4);
+K_MSGQ_DEFINE(control_queue, sizeof(struct control_event), QUEUE_DEPTH, 4);
+K_SEM_DEFINE(maintenance_start, 0, 1);
+extern struct k_timer event_timer;
 
-static int wdt_channel = -1;
-static atomic_t wdt_expired_count;
-static atomic_t producer_dropped;
-static volatile bool producer_done;
-static volatile bool consumer_done;
+static uint32_t next_seq;
+static uint32_t queue_full_drops;
 
-static void wdt_expired_cb(int channel_id, void *user_data)
+static void event_timer_expiry(struct k_timer *timer)
 {
-	ARG_UNUSED(user_data);
+	ARG_UNUSED(timer);
 
-	atomic_inc(&wdt_expired_count);
-	LOG_ERR("[WDT] channel %d expired at %u ms: consumer not fed (q=%u/%d)",
-		channel_id, k_uptime_get_32(),
-		k_msgq_num_used_get(&pipe_q), QUEUE_DEPTH);
-}
-
-static void producer_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	for (uint32_t seq = 0; seq < TOTAL_MESSAGES; seq++) {
-		struct sample s = {
-			.seq = seq,
-			.ts_ms = k_uptime_get_32(),
-		};
-
-		if (k_msgq_put(&pipe_q, &s, K_NO_WAIT) != 0) {
-			atomic_inc(&producer_dropped);
-			LOG_WRN("[PROD] queue full, dropped seq=%u", seq);
-		}
-
-		k_msleep(PRODUCE_PERIOD_MS);
+	if (next_seq >= EVENT_TOTAL) {
+		k_timer_stop(&event_timer);
+		return;
 	}
 
-	producer_done = true;
-	LOG_INF("[PROD] done");
+	struct control_event event = {
+		.seq = next_seq++,
+		.ready_ticks = k_uptime_ticks(),
+	};
+
+	sys_trace_named_event("evt_ready", event.seq, 0);
+
+	if (k_msgq_put(&control_queue, &event, K_NO_WAIT) != 0) {
+		queue_full_drops++;
+		return;
+	}
+
+	k_sem_give(&maintenance_start);
 }
 
-static void consumer_fn(void *p1, void *p2, void *p3)
+K_TIMER_DEFINE(event_timer, event_timer_expiry, NULL);
+
+static void control_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
 	uint32_t processed = 0;
+	uint32_t misses = 0;
+	uint32_t expected_seq = 0;
+	uint32_t lost = 0;
+	uint32_t max_latency_us = 0;
 
-	while (true) {
-		struct sample s;
-		int ret = k_msgq_get(&pipe_q, &s, K_MSEC(500));
+	while (processed < EVENT_TOTAL) {
+		struct control_event event;
+		int ret = k_msgq_get(&control_queue, &event, K_FOREVER);
 
 		if (ret != 0) {
-			if (producer_done && k_msgq_num_used_get(&pipe_q) == 0) {
-				break;
-			}
-			task_wdt_feed(wdt_channel);
+			LOG_ERR("[CONTROL] receive failed: %d", ret);
 			continue;
 		}
 
-		processed++;
-		LOG_INF("[CONS] seq=%u age=%ums q=%u/%d",
-			s.seq, k_uptime_get_32() - s.ts_ms,
-			k_msgq_num_used_get(&pipe_q), QUEUE_DEPTH);
+		if (event.seq != expected_seq) {
+			lost += event.seq - expected_seq;
+			LOG_WRN("[CONTROL] seq gap: expected=%u got=%u", expected_seq, event.seq);
+		}
+		expected_seq = event.seq + 1;
 
-		if (processed == STUCK_AFTER_MSG) {
-			LOG_WRN("[CONS] simulating stuck consumer for %d ms",
-				STUCK_TIME_MS);
-			k_msleep(STUCK_TIME_MS);
-			LOG_WRN("[CONS] resumed after stall");
-		} else {
-			k_msleep(CONSUME_TIME_MS);
+		int64_t latency_ticks = k_uptime_ticks() - event.ready_ticks;
+		uint32_t latency_us = (uint32_t)k_ticks_to_us_floor64(latency_ticks);
+		bool miss = latency_us > DEADLINE_US;
+
+		if (latency_us > max_latency_us) {
+			max_latency_us = latency_us;
 		}
 
-		task_wdt_feed(wdt_channel);
+		sys_trace_named_event("ctrl_start", event.seq, latency_us);
+
+		if (miss) {
+			misses++;
+			LOG_WRN("[CONTROL] seq=%u DEADLINE MISS start_latency=%u us (limit %d us) misses=%u",
+				event.seq, latency_us, DEADLINE_US, misses);
+		} else {
+			LOG_INF("[CONTROL] seq=%u start_latency=%u us ok",
+				event.seq, latency_us);
+		}
+
+		sys_trace_named_event("ctrl_done", event.seq, latency_us);
+		processed++;
+
+		if ((processed % SUMMARY_EVERY) == 0) {
+			LOG_INF("[SUMMARY] processed=%u misses=%u max_latency=%u us lost=%u",
+				processed, misses, max_latency_us, lost);
+		}
 	}
 
-	consumer_done = true;
-	LOG_INF("[CONS] done processed=%u", processed);
+	LOG_INF("[FINAL] processed=%u misses=%u max_latency=%u us lost=%u queue_full_drops=%u",
+		processed, misses, max_latency_us, lost, queue_full_drops);
 }
 
-static void health_fn(void *p1, void *p2, void *p3)
+static void maintenance_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	bool warned = false;
-
-	while (!consumer_done) {
-		uint32_t used = k_msgq_num_used_get(&pipe_q);
-
-		if (used >= WARN_LEVEL && !warned) {
-			LOG_WRN("[HEALTH] queue at %u/%d (%u%%) >= %d%%",
-				used, QUEUE_DEPTH,
-				(used * 100) / QUEUE_DEPTH, WARN_PERCENT);
-			warned = true;
-		} else if (used < WARN_LEVEL && warned) {
-			LOG_INF("[HEALTH] queue recovered to %u/%d", used, QUEUE_DEPTH);
-			warned = false;
-		}
-
-		k_msleep(HEALTH_PERIOD_MS);
+	while (true) {
+		k_sem_take(&maintenance_start, K_FOREVER);
+		k_busy_wait(MAINTENANCE_LOAD_US);
 	}
-
-	LOG_INF("[HEALTH] stopped");
 }
 
-K_THREAD_DEFINE(producer_tid, STACK_SIZE, producer_fn,
-		NULL, NULL, NULL, PRIO_PRODUCER, 0, 0);
-K_THREAD_DEFINE(consumer_tid, STACK_SIZE, consumer_fn,
-		NULL, NULL, NULL, PRIO_CONSUMER, 0, 0);
-K_THREAD_DEFINE(health_tid, STACK_SIZE, health_fn,
-		NULL, NULL, NULL, PRIO_HEALTH, 0, 0);
+K_THREAD_DEFINE(control, STACK_SIZE, control_fn,
+		NULL, NULL, NULL, CONTROL_PRIORITY, 0, 0);
+
+K_THREAD_DEFINE(maintenance, STACK_SIZE, maintenance_fn,
+		NULL, NULL, NULL, MAINTENANCE_PRIORITY, 0, 0);
 
 int main(void)
 {
-	int ret = task_wdt_init(NULL);
+	LOG_INF("=== L6 Runtime Investigation ===");
+	LOG_INF("deadline=%d us start latency, period=%d ms, events=%d",
+		DEADLINE_US, EVENT_PERIOD_MS, EVENT_TOTAL);
+	LOG_INF("control prio=%d maintenance prio=%d maintenance busy=%d us",
+		CONTROL_PRIORITY, MAINTENANCE_PRIORITY, MAINTENANCE_LOAD_US);
 
-	if (ret != 0) {
-		LOG_ERR("task_wdt_init failed: %d", ret);
-		return ret;
-	}
-
-	wdt_channel = task_wdt_add(WDT_PERIOD_MS, wdt_expired_cb, NULL);
-	if (wdt_channel < 0) {
-		LOG_ERR("task_wdt_add failed: %d", wdt_channel);
-		return wdt_channel;
-	}
-
-	LOG_INF("=== L5 Reliability: producer/consumer + task WDT ===");
-	LOG_INF("queue depth=%d warn=%d%% (%d) wdt=%dms stall=%dms at msg %d",
-		QUEUE_DEPTH, WARN_PERCENT, WARN_LEVEL,
-		WDT_PERIOD_MS, STUCK_TIME_MS, STUCK_AFTER_MSG);
+	k_timer_start(&event_timer, K_MSEC(500), K_MSEC(EVENT_PERIOD_MS));
 
 	return 0;
 }
