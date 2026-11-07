@@ -1,132 +1,167 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/zbus/zbus.h>
+#include <zephyr/task_wdt/task_wdt.h>
 
-LOG_MODULE_REGISTER(zbus_demo, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(reliability, LOG_LEVEL_DBG);
 
-#define PUBLISH_PERIOD_MS    100
-#define SAMPLE_COUNT         50
-#define LOGGER_DELAY_MS      500
-#define LOGGER_QUEUE_SIZE    8
-#define STACK_SIZE           1024
-#define PRIO_PUBLISHER       5
-#define PRIO_LOGGER          7
+#define STACK_SIZE            1024
+#define PRIO_PRODUCER         5
+#define PRIO_CONSUMER         5
+#define PRIO_HEALTH           7
 
-struct sensor_msg {
+#define QUEUE_DEPTH           8
+#define WARN_PERCENT          75
+#define WARN_LEVEL            ((QUEUE_DEPTH * WARN_PERCENT) / 100)
+
+#define PRODUCE_PERIOD_MS     50
+#define CONSUME_TIME_MS       40
+#define TOTAL_MESSAGES        200
+#define STUCK_AFTER_MSG       20
+#define STUCK_TIME_MS         3000
+#define WDT_PERIOD_MS         1000
+#define HEALTH_PERIOD_MS      100
+
+struct sample {
 	uint32_t seq;
-	int32_t temp_c_x100;
-	uint32_t humidity_pct;
-	uint32_t tick_ms;
+	uint32_t ts_ms;
 };
 
-static void display_listener_cb(const struct zbus_channel *chan);
-ZBUS_LISTENER_DEFINE(display_listener, display_listener_cb);
-ZBUS_SUBSCRIBER_DEFINE(logger_sub, LOGGER_QUEUE_SIZE);
+K_MSGQ_DEFINE(pipe_q, sizeof(struct sample), QUEUE_DEPTH, 4);
 
-ZBUS_CHAN_DEFINE(sensor_chan,
-		 struct sensor_msg,
-		 NULL,
-		 NULL,
-		 ZBUS_OBSERVERS(display_listener, logger_sub),
-		 ZBUS_MSG_INIT(0));
+static int wdt_channel = -1;
+static atomic_t wdt_expired_count;
+static atomic_t producer_dropped;
+static volatile bool producer_done;
+static volatile bool consumer_done;
 
-static void display_listener_cb(const struct zbus_channel *chan)
+static void wdt_expired_cb(int channel_id, void *user_data)
 {
-	const struct sensor_msg *msg = zbus_chan_const_msg(chan);
+	ARG_UNUSED(user_data);
 
-	LOG_INF("[DISPLAY] seq=%u  temp=%d.%02d C  hum=%u%%",
-		msg->seq, msg->temp_c_x100 / 100,
-		(msg->temp_c_x100 < 0 ? -msg->temp_c_x100 : msg->temp_c_x100) % 100,
-		msg->humidity_pct);
+	atomic_inc(&wdt_expired_count);
+	LOG_ERR("[WDT] channel %d expired at %u ms: consumer not fed (q=%u/%d)",
+		channel_id, k_uptime_get_32(),
+		k_msgq_num_used_get(&pipe_q), QUEUE_DEPTH);
 }
 
-static void publisher_fn(void *p1, void *p2, void *p3)
+static void producer_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	int64_t next = k_uptime_get();
-
-	for (uint32_t seq = 0; seq < SAMPLE_COUNT; seq++) {
-		struct sensor_msg msg = {
+	for (uint32_t seq = 0; seq < TOTAL_MESSAGES; seq++) {
+		struct sample s = {
 			.seq = seq,
-			.temp_c_x100 = 2000 + (int32_t)(seq % 20) * 10,
-			.humidity_pct = 40 + (seq % 10),
-			.tick_ms = (uint32_t)k_uptime_get_32(),
+			.ts_ms = k_uptime_get_32(),
 		};
 
-		int ret = zbus_chan_pub(&sensor_chan, &msg, K_MSEC(10));
-
-		if (ret < 0) {
-			LOG_ERR("publish seq=%u failed: %d", seq, ret);
+		if (k_msgq_put(&pipe_q, &s, K_NO_WAIT) != 0) {
+			atomic_inc(&producer_dropped);
+			LOG_WRN("[PROD] queue full, dropped seq=%u", seq);
 		}
 
-		next += PUBLISH_PERIOD_MS;
-		int64_t sleep_ms = next - k_uptime_get();
-
-		if (sleep_ms > 0) {
-			k_msleep(sleep_ms);
-		}
+		k_msleep(PRODUCE_PERIOD_MS);
 	}
 
-	LOG_INF("[PUBLISHER] done, %d samples published", SAMPLE_COUNT);
+	producer_done = true;
+	LOG_INF("[PROD] done");
 }
 
-static void logger_fn(void *p1, void *p2, void *p3)
+static void consumer_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	const struct zbus_channel *chan;
-	struct sensor_msg msg;
-	uint32_t logged = 0;
-	uint32_t last_seq = 0;
-	bool first = true;
+	uint32_t processed = 0;
 
-	while (1) {
-		int ret = zbus_sub_wait(&logger_sub, &chan, K_MSEC(1000));
+	while (true) {
+		struct sample s;
+		int ret = k_msgq_get(&pipe_q, &s, K_MSEC(500));
 
-		if (ret == -EAGAIN) {
-			break;
-		}
-
-		if (ret < 0) {
-			LOG_ERR("sub_wait failed: %d", ret);
+		if (ret != 0) {
+			if (producer_done && k_msgq_num_used_get(&pipe_q) == 0) {
+				break;
+			}
+			task_wdt_feed(wdt_channel);
 			continue;
 		}
 
-		ret = zbus_chan_read(chan, &msg, K_MSEC(100));
-		if (ret < 0) {
-			LOG_ERR("chan_read failed: %d", ret);
-			continue;
+		processed++;
+		LOG_INF("[CONS] seq=%u age=%ums q=%u/%d",
+			s.seq, k_uptime_get_32() - s.ts_ms,
+			k_msgq_num_used_get(&pipe_q), QUEUE_DEPTH);
+
+		if (processed == STUCK_AFTER_MSG) {
+			LOG_WRN("[CONS] simulating stuck consumer for %d ms",
+				STUCK_TIME_MS);
+			k_msleep(STUCK_TIME_MS);
+			LOG_WRN("[CONS] resumed after stall");
+		} else {
+			k_msleep(CONSUME_TIME_MS);
 		}
 
-		k_msleep(LOGGER_DELAY_MS);
-
-		logged++;
-		if (!first && msg.seq > last_seq + 1) {
-			LOG_WRN("[LOGGER] skipped %u samples", msg.seq - last_seq - 1);
-		}
-		first = false;
-		last_seq = msg.seq;
-
-		LOG_INF("[LOGGER] seq=%u tick=%u temp=%d hum=%u",
-			msg.seq, msg.tick_ms, msg.temp_c_x100, msg.humidity_pct);
+		task_wdt_feed(wdt_channel);
 	}
 
-	LOG_INF("[LOGGER] finished, logged=%u", logged);
+	consumer_done = true;
+	LOG_INF("[CONS] done processed=%u", processed);
 }
 
-K_THREAD_DEFINE(publisher_tid, STACK_SIZE, publisher_fn,
-		NULL, NULL, NULL, PRIO_PUBLISHER, 0, 0);
-K_THREAD_DEFINE(logger_tid, STACK_SIZE, logger_fn,
-		NULL, NULL, NULL, PRIO_LOGGER, 0, 0);
+static void health_fn(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	bool warned = false;
+
+	while (!consumer_done) {
+		uint32_t used = k_msgq_num_used_get(&pipe_q);
+
+		if (used >= WARN_LEVEL && !warned) {
+			LOG_WRN("[HEALTH] queue at %u/%d (%u%%) >= %d%%",
+				used, QUEUE_DEPTH,
+				(used * 100) / QUEUE_DEPTH, WARN_PERCENT);
+			warned = true;
+		} else if (used < WARN_LEVEL && warned) {
+			LOG_INF("[HEALTH] queue recovered to %u/%d", used, QUEUE_DEPTH);
+			warned = false;
+		}
+
+		k_msleep(HEALTH_PERIOD_MS);
+	}
+
+	LOG_INF("[HEALTH] stopped");
+}
+
+K_THREAD_DEFINE(producer_tid, STACK_SIZE, producer_fn,
+		NULL, NULL, NULL, PRIO_PRODUCER, 0, 0);
+K_THREAD_DEFINE(consumer_tid, STACK_SIZE, consumer_fn,
+		NULL, NULL, NULL, PRIO_CONSUMER, 0, 0);
+K_THREAD_DEFINE(health_tid, STACK_SIZE, health_fn,
+		NULL, NULL, NULL, PRIO_HEALTH, 0, 0);
 
 int main(void)
 {
-	LOG_INF("=== L4 zbus: sensor channel ===");
-	LOG_INF("publish every %dms, %d samples", PUBLISH_PERIOD_MS, SAMPLE_COUNT);
+	int ret = task_wdt_init(NULL);
+
+	if (ret != 0) {
+		LOG_ERR("task_wdt_init failed: %d", ret);
+		return ret;
+	}
+
+	wdt_channel = task_wdt_add(WDT_PERIOD_MS, wdt_expired_cb, NULL);
+	if (wdt_channel < 0) {
+		LOG_ERR("task_wdt_add failed: %d", wdt_channel);
+		return wdt_channel;
+	}
+
+	LOG_INF("=== L5 Reliability: producer/consumer + task WDT ===");
+	LOG_INF("queue depth=%d warn=%d%% (%d) wdt=%dms stall=%dms at msg %d",
+		QUEUE_DEPTH, WARN_PERCENT, WARN_LEVEL,
+		WDT_PERIOD_MS, STUCK_TIME_MS, STUCK_AFTER_MSG);
+
 	return 0;
 }
