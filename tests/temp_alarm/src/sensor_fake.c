@@ -10,7 +10,8 @@
 /* Exactly one of these per test binary. */
 DEFINE_FFF_GLOBALS;
 
-/* TODO(l8-task0): define fake_sensor_sample_fetch, matching your declaration in sensor_fake.h. */
+DEFINE_FAKE_VALUE_FUNC(int, fake_sensor_sample_fetch, const struct device *,
+		       enum sensor_channel);
 
 DEFINE_FAKE_VALUE_FUNC(int, fake_sensor_channel_get, const struct device *, enum sensor_channel,
 		       struct sensor_value *);
@@ -39,8 +40,7 @@ static int custom_sensor_channel_get(const struct device *dev, enum sensor_chann
 
 /* The API table temp_alarm.c calls through. */
 static const struct sensor_driver_api fake_sensor_api = {
-	/* TODO(l8-task0): replace NULL with fake_sensor_sample_fetch. */
-	.sample_fetch = NULL,
+	.sample_fetch = fake_sensor_sample_fetch,
 	.channel_get = fake_sensor_channel_get,
 };
 
@@ -70,7 +70,7 @@ void sensor_fake_init(void)
 
 void sensor_fake_reset(void)
 {
-	/* TODO(l8-task0): reset fake_sensor_sample_fetch here too. */
+	RESET_FAKE(fake_sensor_sample_fetch);
 	RESET_FAKE(fake_sensor_channel_get);
 	FFF_RESET_HISTORY();
 
